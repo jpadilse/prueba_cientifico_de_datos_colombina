@@ -1,0 +1,358 @@
+---
+title: "Prueba Científico de Datos Colombina"
+author: "Juan Felipe Padilla Sepulveda"
+date: "2022-07-18"
+format: html
+jupyter: python3
+lang: es
+---
+
+# Librerias
+
+```{python}
+#%pip install matplotlib
+#%pip install numpy
+#%pip install pandas
+#%pip install plotly
+#%pip install sklearn
+#%pip install xgboost
+#%pip install pyjanitor
+#%pip install shap
+
+import numpy as np
+import pandas as pd
+import plotly.figure_factory as ff
+import shap
+import xgboost as xgb
+from sklearn.compose import ColumnTransformer
+from sklearn.metrics import accuracy_score, confusion_matrix
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.utils import class_weight
+
+import janitor as jn
+```
+
+# Cargar Información
+
+## Descomprimir
+
+Se usa `bash` para tener un vistazo de la estructura del archivo sin tener que importarlo directamente.
+
+```{bash}
+#| eval: false
+cd ..
+cd data/bronze/
+unzip prueba_DS.zip
+head prueba_DS.txt
+```
+
+## Importar
+
+```{python}
+raw_data = pd.read_csv("../data/bronze/prueba_DS.txt")
+```
+
+## Limpieza
+
+Se elimina la columna `Moneda` porque es constante para toda la base de datos. Asimismo, se cambia el formato de la columna `Fecha`.
+
+```{python}
+raw_data["Moneda"].nunique()
+```
+
+```{python}
+clean_data = (raw_data
+  .drop(columns = ["Moneda"])
+  .assign(Fecha = lambda df: pd.to_datetime(df["Fecha"])))
+```
+
+## Separar Último Periodo
+
+```{python}
+max_date = clean_data["Fecha"].max() 
+cutoff_date = max_date - pd.DateOffset(months = 2)
+valid_data = clean_data[clean_data["Fecha"] < cutoff_date]
+output_data = (clean_data
+  .loc[clean_data["Fecha"] >= cutoff_date, ["Solic", "Fecha"]]
+  .groupby(["Solic"])
+  .min()
+  .reset_index()
+  .clean_names(case_type = "upper"))
+```
+
+Se usan los últimos dos meses para crear la variable dependiente y entrenar el modelo.
+
+# Agregación
+
+## Por Pedido
+
+Primero se consolida la información por pedido para agrupar todos los datos que se tinen por producto.
+
+```{python}
+clean_data_pedidos = (valid_data
+  .groupby(["Solic", "Doc_vtas", "Fecha"])
+  .agg(
+    {
+      "Material" : ["size"],
+      "Cnt_uni" : ["sum"],
+      "sect_mat": ["nunique"],
+      "ValN_Pos": ["sum"]
+    }
+  )
+  .reset_index()
+  .clean_names(case_type = "upper"))
+  
+clean_data_pedidos.columns = [
+  "SOLIC", 
+  "DOC_VTAS",
+  "FECHA", 
+  "N_PRODUCTOS",
+  "TOTAL_UNI",
+  "N_SECT", 
+  "VALOR_TOTAL"
+]
+```
+
+## Por Cliente
+
+Luego, se colapsa la información de pedidos por cliente para lograr tener indicadores por cliente que evidencien su comportamiento histórico.
+
+```{python}
+clean_data_cliente = (clean_data_pedidos
+  .groupby(["SOLIC"])
+  .agg(
+    {
+      "FECHA" : ["min", "max"],
+      "DOC_VTAS" : ["size"],
+      "N_PRODUCTOS": ["mean", "std"],
+      "TOTAL_UNI": ["mean", "std"],
+      "N_SECT": ["mean", "std"],
+      "VALOR_TOTAL": ["mean", "std"]
+    }
+  )
+  .reset_index())
+  
+clean_data_cliente.columns = [
+  "SOLIC", 
+  "FECHA_MIN",
+  "FECHA_MAX",
+  "N_PEDIDOS",
+  "N_PRODUCTOS_PROM",
+  "N_PRODUCTOS_SD",
+  "TOTAL_UNI_PROM",
+  "TOTAL_UNI_SD",
+  "N_SECT_PROM",
+  "N_SECT_SD",
+  "VALOR_TOTAL_PROM",
+  "VALOR_TOTAL_SD"
+]
+```
+
+## Uso de fechas
+
+Es importante mencionar que con el fin de cumplir la definición del negocio se considera que un cliente se fugo si a la fecha del corte aun no cumple 60 días desde su última compra pero si los cumple en un lapso de dos meses hacia el futuro. Asimismo, solo se tiene en cuenta clientes con más de un pedido.
+
+```{python}
+max_valid = valid_data["Fecha"].max() 
+
+data_features = (clean_data_cliente
+  .assign(
+    ANTIGUEDAD_TOTAL_DIAS = lambda df: (max_valid - df["FECHA_MIN"]).dt.days,
+    ANTIGUEDAD_ULTIMA_DIAS = lambda df: (max_valid - df["FECHA_MAX"]).dt.days
+  )
+  .drop(columns = ["FECHA_MIN", "FECHA_MAX"])
+  .query("ANTIGUEDAD_ULTIMA_DIAS < 60 & N_PEDIDOS > 1"))
+```
+
+# Matriz de características
+
+## Consolidación
+
+```{python}
+data_features_output = (pd.merge(
+  data_features, 
+  output_data,
+  how = "left",
+  on = "SOLIC"
+)
+.assign(
+  TIEMPO_CORTE = lambda df: (df["FECHA"] - max_valid).dt.days,
+  TMP = lambda df: df["ANTIGUEDAD_ULTIMA_DIAS"] + df["TIEMPO_CORTE"].fillna(0),
+  FUGADO = lambda df: np.where(
+    (df["FECHA"].isnull()) | (df["TMP"] >= 60),
+    1, 
+    0
+  )
+)
+.drop(columns = ["FECHA", "TIEMPO_CORTE", "TMP"]))
+```
+
+## Salvar Matriz
+
+```{python}
+(data_features_output
+  .drop(columns = ["SOLIC"])
+  .to_csv("../data/silver/features.csv", index = False))
+```
+
+# Modelo
+
+## División
+
+Lo primero es dividir la base de datos con el fin de separar la información con la que se entrenara el modelo de aquella con la cual se realizara la validación final de los datos. Específicamente, se deja el 80 % de los datos para la construcción del modelo y el 20 % para la validación final.
+
+```{python}
+train, test = train_test_split(
+  data_features_output.set_index("SOLIC"), 
+  test_size = 0.2,
+  random_state = 1112494378,
+  stratify = data_features_output[["FUGADO"]]
+)
+print(train.shape)
+print(test.shape)
+```
+
+## Construcción del modelo
+
+El modelo a usar es XGBoost debido a su gran capacidad de predicción y poca necesidad de preprocesamiento de los datos. Asimismo, se tienen las siguientes consideraciones:
+
+- Se uso pesos en el modelo para mitigar el desbalanceo en la base de datos.
+-   Debido a la poca cantidad de variables disponibles se usarán todas con el objetivo de buscar la mayor precisión en la predicción.
+-   El tipo de modelo es categórico debido a que la variable que se requiere predecir es categórica.
+
+## Preprocesamiento
+
+```{python}
+output = ["FUGADO"]
+output_txt = "FUGADO"
+ratio_classes = train[output_txt].value_counts()
+
+features = [
+  'N_PEDIDOS',
+  'N_PRODUCTOS_PROM', 
+  'N_PRODUCTOS_SD',
+  'TOTAL_UNI_PROM',
+  'TOTAL_UNI_SD',
+  'N_SECT_PROM', 
+  'N_SECT_SD', 
+  'VALOR_TOTAL_PROM',
+  'VALOR_TOTAL_SD',
+  'ANTIGUEDAD_TOTAL_DIAS',
+  'ANTIGUEDAD_ULTIMA_DIAS' 
+]
+
+numeric_transformer = Pipeline(
+  steps = [('scaler', StandardScaler(with_mean = False, with_std = False))]
+)
+
+preprocessor = ColumnTransformer(
+    transformers = [('num', numeric_transformer, features)]
+)
+
+pipeline = Pipeline(
+  steps = [
+    ('preprocessor', preprocessor),
+    (
+      'regressor', 
+      xgb.XGBClassifier(scale_pos_weight = ratio_classes[0] / ratio_classes[1])
+    )
+  ]
+)
+
+model = pipeline.fit(train[features], train[output])
+```
+
+## Validación
+
+```{python}
+def assess_accuracy(model, dataset, label):
+    """
+    Retorna precisión del modelo para diferentes conuntos de datos
+    """ 
+    actual = dataset[label]        
+    predictions = model.predict(dataset[features])
+    acc = accuracy_score(actual, predictions)
+    return acc, actual, predictions
+
+acc_train, actual_train, predictions_train = assess_accuracy(model, train, output_txt)
+acc_test, actual_test, predictions_test = assess_accuracy(model, test, output_txt)
+
+print("Precisión de entrenamiento:", acc_train)
+print("Precisión de evaluación:", acc_test)
+```
+
+```{python}
+cm = confusion_matrix(actual_train, predictions_train)
+x = y = sorted(list(test[output_txt].unique()))
+fig = ff.create_annotated_heatmap(cm, x, y)
+fig.update_layout(
+    title_text = "<b>Matriz de Confusión</b>", 
+    yaxis = dict(categoryorder = "category descending")
+)
+fig.add_annotation(
+  dict(
+    font = dict(color = "black", size = 14),
+    x = 0.5,
+    y = -0.15,
+    showarrow = False,
+    text = "Pronóstico",
+    xref = "paper",
+    yref = "paper"
+  )
+)
+fig.add_annotation(
+  dict(
+    font = dict(color = "black", size = 14),
+    x = -0.15,
+    y = 0.5,
+    showarrow = False,
+    text = "Real",
+    textangle = -90,
+    xref = "paper",
+    yref = "paper"
+  )
+)
+fig.update_layout(margin = dict(t = 80, r = 20, l = 100, b = 50))
+fig['data'][0]['showscale'] = True
+fig.show()
+```
+
+## Variables Importantes
+
+Con el fin de conocer las variables significativas a la hora de predecir el costo anual de un usuario de este programa se utiliza una medida de importancia de variables basada en la contribución a la predicción (SHAP).
+
+```{python}
+explainer = shap.TreeExplainer(model.named_steps["regressor"])
+shap_values = explainer.shap_values(test[features])
+shap.summary_plot(shap_values, test[features], plot_type = "bar")
+```
+
+```{python}
+shap.summary_plot(shap_values, test[features])
+```
+
+De los anteriores gráficos se puede observar que las variables más importantes a la hora de predecir la fuga de un cliente: tiempo desde la ultima compra, el número de pedidos históricos, el valor promedio de compra por pedido y el promedio de sectores al que pertenecen los productos.
+
+# Exportar Predicciones
+
+```{python}
+id_total = pd.concat(
+  [
+    pd.DataFrame(train.index),
+    pd.DataFrame(test.index)
+  ]
+)
+
+prediccion_total = pd.concat(
+  [
+    pd.DataFrame(predictions_train, columns = ["prediccion"]),
+    pd.DataFrame(predictions_test, columns = ["prediccion"])
+  ]
+)
+
+(pd.concat([id_total, prediccion_total], axis = 1)
+  .to_csv("../data/gold/predicciones_modelo.csv", index = False))
+```
+
